@@ -1,0 +1,190 @@
+# ============================================
+# Hybrid Fake News Classifier
+# TF-IDF + BiLSTM + Attention + Logistic Fusion
+# ============================================
+
+# ---------- Imports ----------
+import pandas as pd
+import numpy as np
+import re
+import warnings
+import nltk
+
+from nltk.corpus import stopwords
+from nltk.stem import PorterStemmer
+
+from sklearn.model_selection import train_test_split
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, confusion_matrix
+
+from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Embedding, LSTM, Bidirectional,
+    Dense, Dropout, Attention, GlobalAveragePooling1D
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+warnings.filterwarnings("ignore")
+
+# ---------- NLTK Setup ----------
+nltk.download("punkt")
+nltk.download("stopwords")
+
+# ---------- Load Dataset ----------
+df = pd.read_csv("news.csv", engine="python", on_bad_lines="skip")
+
+# ---------- Text Preprocessing ----------
+stop_words = set(stopwords.words("english"))
+stemmer = PorterStemmer()
+
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+", "", text)
+    text = re.sub(r"[^a-z ]", " ", text)
+
+    tokens = nltk.word_tokenize(text)
+    tokens = [w for w in tokens if w not in stop_words]
+    tokens = [stemmer.stem(w) for w in tokens]
+
+    return " ".join(tokens)
+
+df["text"] = (
+    df["Titel"].fillna("") + " " + df["Body"].fillna("")
+).apply(clean_text)
+
+df.dropna(subset=["Fake"], inplace=True)
+
+X = df["text"].values
+y = df["Fake"].values
+
+# ---------- Train Test Split ----------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# ============================================
+# TF-IDF + Gradient Boosting
+# ============================================
+tfidf = TfidfVectorizer(
+    max_features=7000,
+    ngram_range=(1, 2)
+)
+
+X_train_tfidf = tfidf.fit_transform(X_train)
+X_test_tfidf = tfidf.transform(X_test)
+
+gb_model = GradientBoostingClassifier(
+    n_estimators=150,
+    learning_rate=0.1,
+    max_depth=3,
+    random_state=42
+)
+
+gb_model.fit(X_train_tfidf, y_train)
+
+tfidf_train_preds = gb_model.predict_proba(X_train_tfidf)[:, 1]
+tfidf_test_preds = gb_model.predict_proba(X_test_tfidf)[:, 1]
+
+# ============================================
+# BiLSTM + Attention Model
+# ============================================
+MAX_WORDS = 15000
+MAX_LEN = 250
+
+tokenizer = Tokenizer(num_words=MAX_WORDS)
+tokenizer.fit_on_texts(X_train)
+
+X_train_seq = pad_sequences(
+    tokenizer.texts_to_sequences(X_train),
+    maxlen=MAX_LEN
+)
+
+X_test_seq = pad_sequences(
+    tokenizer.texts_to_sequences(X_test),
+    maxlen=MAX_LEN
+)
+
+input_text = Input(shape=(MAX_LEN,))
+x = Embedding(MAX_WORDS, 128)(input_text)
+x = Bidirectional(LSTM(128, return_sequences=True))(x)
+
+attention = Attention()([x, x])
+x = GlobalAveragePooling1D()(attention)
+
+x = Dense(64, activation="relu")(x)
+x = Dropout(0.4)(x)
+
+output = Dense(1, activation="sigmoid")(x)
+
+lstm_model = Model(input_text, output)
+
+lstm_model.compile(
+    loss="binary_crossentropy",
+    optimizer=Adam(learning_rate=1e-4),
+    metrics=["accuracy"]
+)
+
+early_stop = EarlyStopping(
+    monitor="val_loss",
+    patience=3,
+    restore_best_weights=True
+)
+
+lstm_model.fit(
+    X_train_seq,
+    y_train,
+    validation_split=0.2,
+    epochs=5,
+    batch_size=128,
+    callbacks=[early_stop],
+    verbose=1
+)
+
+lstm_train_preds = lstm_model.predict(X_train_seq).ravel()
+lstm_test_preds = lstm_model.predict(X_test_seq).ravel()
+
+# ============================================
+# Fusion (Stacking)
+# ============================================
+fusion_train = np.column_stack(
+    (tfidf_train_preds, lstm_train_preds)
+)
+fusion_test = np.column_stack(
+    (tfidf_test_preds, lstm_test_preds)
+)
+
+fusion_model = LogisticRegression()
+fusion_model.fit(fusion_train, y_train)
+
+final_preds = fusion_model.predict(fusion_test)
+
+# ============================================
+# Evaluation
+# ============================================
+print("\n--- Final Hybrid Model Evaluation ---\n")
+print(classification_report(y_test, final_preds, digits=4))
+
+cm = confusion_matrix(y_test, final_preds)
+
+plt.figure(figsize=(7, 5))
+sns.heatmap(
+    cm,
+    annot=True,
+    fmt="d",
+    cmap="Blues",
+    xticklabels=["Real", "Fake"],
+    yticklabels=["Real", "Fake"]
+)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix")
+plt.tight_layout()
+plt.show()
